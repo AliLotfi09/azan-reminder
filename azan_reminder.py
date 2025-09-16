@@ -1,6 +1,6 @@
-# azan_reminder_full.py
+# azan_reminder_strict.py
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from datetime import datetime, date
 import threading
 import time
@@ -14,11 +14,11 @@ from plyer import notification
 # تنظیم‌ها
 # ----------------------------
 API_URL = "https://prayer.aviny.com/api/prayertimes/11"
-FETCH_INTERVAL_SECONDS = 30       # هر ۵ دقیقه اوقات شرعی را بگیر
-UI_UPDATE_INTERVAL = 1             # بروزرسانی UI هر ۱ ثانیه
-NOTIFY_INTERVAL = 20               # هر چند ثانیه یک نوتیف در صورت گذشته اذان
-LOCK_AFTER_NOTIF_COUNT = 5         # بعد از چند نوتیف موس مرکز شود و بعد ویندوز قفل شود
-LOCK_MOUSE_DURATION = 60          # مدت نگه داشتن موس در مرکز (ثانیه)
+FETCH_INTERVAL_SECONDS = 30       # دریافت اوقات شرعی هر ۳۰ ثانیه
+UI_UPDATE_INTERVAL = 1            # بروزرسانی UI هر ۱ ثانیه
+NOTIFY_INTERVAL = 20              # فاصله نوتیف در ثانیه
+LOCK_AFTER_NOTIF_COUNT = 5        # تعداد نوتیف قبل از فعال شدن موس و قفل
+LOCK_MOUSE_DURATION = 60          # نگه داشتن موس در مرکز
 TIME_REGEX = re.compile(r'\b([0-1]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b')
 
 # ----------------------------
@@ -31,6 +31,7 @@ class PrayerState:
         self.notifying = False
         self.notif_count = 0
         self.last_notify = None
+        self.read = False  # آیا نماز خوانده شده است؟
 
 # ----------------------------
 # دریافت اوقات شرعی
@@ -64,7 +65,7 @@ def fetch_prayers():
 # ----------------------------
 # موس در مرکز صفحه
 # ----------------------------
-def lock_mouse_center(duration=180):
+def lock_mouse_center(duration=LOCK_MOUSE_DURATION):
     screen_width, screen_height = pyautogui.size()
     center_x, center_y = screen_width // 2, screen_height // 2
     end_time = time.time() + duration
@@ -79,7 +80,7 @@ class AzanApp:
     def __init__(self, root):
         self.root = root
         root.title("یادآور اذان")
-        root.geometry("480x380")
+        root.geometry("500x400")
         root.resizable(False, False)
 
         style = ttk.Style()
@@ -107,6 +108,7 @@ class AzanApp:
         ttk.Button(btn_frame, text="بروز رسانی دستی", command=self.fetch_once).pack(side="left")
         ttk.Button(btn_frame, text="خاموش اعلان‌ها", command=self.stop_notifications).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="روشن اعلان‌ها", command=self.start_notifications).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="حالت سخت‌گیرانه", command=self.toggle_strict_mode).pack(side="left", padx=5)
 
         ttk.Label(frm, text="لاگ:", font=("Tahoma", 12)).pack(anchor="w")
         self.log = tk.Text(frm, height=8, state="disabled", font=("Tahoma",11))
@@ -114,18 +116,26 @@ class AzanApp:
 
         self.prayers = {}
         self.notifications_enabled = True
+        self.strict_mode = False
+        self.first_run_checked = False
         self._stop = False
 
         self.fetch_once()
         threading.Thread(target=self.fetch_loop, daemon=True).start()
         self.ui_updater()
 
+    # ----------------------------
+    # ثبت لاگ
+    # ----------------------------
     def log_msg(self, txt):
         self.log.configure(state="normal")
         self.log.insert("end", f"{datetime.now().strftime('%H:%M:%S')} - {txt}\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    # ----------------------------
+    # دریافت اوقات شرعی
+    # ----------------------------
     def fetch_once(self):
         times = fetch_prayers()
         for name, dt in times.items():
@@ -142,6 +152,9 @@ class AzanApp:
             self.fetch_once()
             time.sleep(FETCH_INTERVAL_SECONDS)
 
+    # ----------------------------
+    # بروزرسانی جدول
+    # ----------------------------
     def refresh_treeview(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
@@ -166,6 +179,9 @@ class AzanApp:
             mins = int((passed.total_seconds()%3600)//60)
             return f"{hrs}س {mins}د گذشته"
 
+    # ----------------------------
+    # نزدیکترین نماز
+    # ----------------------------
     def nearest_prayer(self):
         now = datetime.now()
         nearest = None
@@ -178,26 +194,39 @@ class AzanApp:
                     nearest_diff = diff
         return nearest
 
+    # ----------------------------
+    # آپدیت UI و نوتیف
+    # ----------------------------
     def ui_updater(self):
         try:
             st = self.nearest_prayer()
             if st:
                 self.tree.set(st.name, "status", self.get_status_text(st))
+
+                # بررسی اولین ران شدن برنامه
+                if not self.first_run_checked:
+                    self.ask_prayer_done(st)
+                    self.first_run_checked = True
+
                 if self.notifications_enabled and st.dt and datetime.now() >= st.dt:
-                    if st.notif_count < LOCK_AFTER_NOTIF_COUNT:
-                        if st.last_notify is None or (datetime.now() - st.last_notify).total_seconds() >= NOTIFY_INTERVAL:
-                            threading.Thread(target=self.send_notification, args=(st,), daemon=True).start()
-                    elif st.notif_count >= LOCK_AFTER_NOTIF_COUNT:
-                        # موس رو در مرکز نگه دار
-                        threading.Thread(target=lock_mouse_center, args=(LOCK_MOUSE_DURATION,), daemon=True).start()
-                        # بعد از مدت کوتاه ویندوز رو قفل کن
-                        threading.Thread(target=self.lock_windows, daemon=True).start()
+                    if not st.read:
+                        if st.notif_count < LOCK_AFTER_NOTIF_COUNT:
+                            if st.last_notify is None or (datetime.now() - st.last_notify).total_seconds() >= NOTIFY_INTERVAL:
+                                threading.Thread(target=self.send_notification, args=(st,), daemon=True).start()
+                        elif st.notif_count >= LOCK_AFTER_NOTIF_COUNT and self.strict_mode:
+                            # موس در مرکز
+                            threading.Thread(target=lock_mouse_center, args=(LOCK_MOUSE_DURATION,), daemon=True).start()
+                            # ویندوز قفل
+                            threading.Thread(target=self.lock_windows, daemon=True).start()
         except Exception as e:
             self.log_msg(f"خطا در آپدیت UI: {e}")
         finally:
             if not self._stop:
                 self.root.after(UI_UPDATE_INTERVAL*1000, self.ui_updater)
 
+    # ----------------------------
+    # نوتیف
+    # ----------------------------
     def send_notification(self, st):
         notification.notify(
             title="یادآور اذان",
@@ -209,14 +238,20 @@ class AzanApp:
         st.last_notify = datetime.now()
         self.log_msg(f"اعلان {st.name} ارسال شد ({st.notif_count}/{LOCK_AFTER_NOTIF_COUNT})")
 
+    # ----------------------------
+    # قفل ویندوز
+    # ----------------------------
     def lock_windows(self):
         self.log_msg("سیستم قفل می‌شود! برای نماز بلند شوید.")
-        time.sleep(3)  # تاخیر کوتاه قبل قفل
+        time.sleep(3)
         try:
             os.system("rundll32.exe user32.dll,LockWorkStation")
         except Exception as e:
             self.log_msg(f"خطا در قفل سیستم: {e}")
 
+    # ----------------------------
+    # نوتیف/اعلان‌ها
+    # ----------------------------
     def stop_notifications(self):
         self.notifications_enabled = False
         for st in self.prayers.values():
@@ -229,6 +264,38 @@ class AzanApp:
             st.notif_count = 0
         self.log_msg("اعلان‌ها روشن شدند.")
 
+    # ----------------------------
+    # حالت سخت‌گیرانه
+    # ----------------------------
+    def toggle_strict_mode(self):
+        msg = ("حالت سخت‌گیرانه فعال می‌شود.\n"
+               "- اگر نماز را نخوانده باشید، موس در مرکز صفحه قرار می‌گیرد.\n"
+               "- پس از ۵ دقیقه سیستم قفل خواهد شد.\n"
+               "- آیا می‌خواهید ادامه دهید؟\n\n"
+               "https://github.com/YourGitHubProfile")
+        if messagebox.askyesno("حالت سخت‌گیرانه", msg):
+            self.strict_mode = True
+            self.log_msg("حالت سخت‌گیرانه فعال شد.")
+        else:
+            self.strict_mode = False
+            self.log_msg("حالت سخت‌گیرانه غیرفعال ماند.")
+
+    # ----------------------------
+    # سوال اولین بار اجرا
+    # ----------------------------
+    def ask_prayer_done(self, st):
+        if st.dt and datetime.now() >= st.dt:
+            res = messagebox.askyesno("سوال نماز", f"نماز {st.name} را خوانده‌اید؟")
+            if res:
+                st.read = True
+                self.log_msg(f"نماز {st.name} خوانده شد.")
+            else:
+                st.read = False
+                self.log_msg(f"نماز {st.name} خوانده نشده، نوتیف ادامه می‌یابد.")
+
+    # ----------------------------
+    # متوقف کردن
+    # ----------------------------
     def stop(self):
         self._stop = True
 
